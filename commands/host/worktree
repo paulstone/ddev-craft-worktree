@@ -1,23 +1,32 @@
 #!/usr/bin/env bash
 #ddev-generated
 ## Description: Manage git worktrees that each get their own DDEV project + seeded database
-## Usage: worktree <add|init|rm|list> [branch|worktree] [flags]
+## Usage: worktree <add|init|rm|list|config> [branch|worktree] [flags]
 ## Example: |-
 ##   ddev worktree add feature/new-thing         # worktree + ddev project + fresh DB copy
 ##   ddev worktree add feature/x --keep-db ../myproject-dbs   # retain the dump
 ##   ddev worktree add feature/x --reuse-db      # reuse newest dump (needs WORKTREE_DB_DIR/--keep-db)
 ##   ddev worktree add feature/x --no-db         # skip the database seed
 ##   ddev worktree add feature/x --from main     # base a new branch on another ref
+##   ddev worktree add feature/x --no-build      # skip npm/yarn install + build this time
 ##   ddev worktree init                          # provision the existing worktree you are in
 ##   ddev worktree init some-worktree            # ...or a named one (takes the same DB flags as add)
 ##   ddev worktree list
+##   ddev worktree config                        # show the settings a new worktree would get
 ##   ddev worktree rm new-thing                  # ddev delete + git worktree remove
 ##   ddev worktree rm new-thing --force          # ...discarding uncommitted changes
-## Flags: [{"Name":"from","Usage":"base ref for a new branch (default: main worktree HEAD)"},{"Name":"keep-db","Usage":"directory to retain the seed dump in (default: temp, deleted after import)"},{"Name":"reuse-db","Usage":"reuse the newest dump instead of exporting a fresh one"},{"Name":"no-db","Usage":"skip the database seed"},{"Name":"no-start","Usage":"scaffold only; do not run ddev start"},{"Name":"force","Usage":"rm: discard uncommitted changes in the worktree"}]
+## Flags: [{"Name":"from","Usage":"base ref for a new branch (default: main worktree HEAD)"},{"Name":"keep-db","Usage":"directory to retain the seed dump in (default: temp, deleted after import)"},{"Name":"reuse-db","Usage":"reuse the newest dump instead of exporting a fresh one"},{"Name":"no-db","Usage":"skip the database seed"},{"Name":"no-start","Usage":"scaffold only; do not run ddev start"},{"Name":"no-build","Usage":"skip npm/yarn install and the front-end build"},{"Name":"force","Usage":"rm: discard uncommitted changes in the worktree"}]
 #
 # Part of the ddev-craft-worktree add-on. Per-project settings live in .ddev/worktree.conf.
 
 set -euo pipefail
+
+die()  { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
+info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
+note() { printf '\033[33m==>\033[0m %s\n' "$*"; }
+
+git -C "${DDEV_APPROOT}" rev-parse --git-dir >/dev/null 2>&1 \
+  || die "ddev worktree needs the project to be a git repository (${DDEV_APPROOT} is not)"
 
 # The main worktree is always the first entry of `git worktree list`.
 MAIN_ROOT="$(git -C "${DDEV_APPROOT}" worktree list --porcelain | sed -n '/^worktree /{s///p;q;}')"
@@ -34,43 +43,30 @@ PROJECT_TYPE="${DDEV_PROJECT_TYPE:-$(yaml_value type "$MAIN_ROOT/.ddev/config.ya
 DOCROOT="$(yaml_value docroot "$MAIN_ROOT/.ddev/config.yaml")"
 TLD="${DDEV_TLD:-ddev.site}"
 
-# ---- Settings (override any of these in .ddev/worktree.conf) ---------------------------
-# Untracked files copied from the main checkout. Copied .env* files get their
-# ://<project>.<tld> URLs repointed at the worktree's own hostname.
-WORKTREE_COPY_FILES=(.env)
-# Untracked directories cloned from the main checkout. On APFS (macOS) and reflink-capable
-# Linux filesystems this is copy-on-write: no extra disk until a file is changed.
-WORKTREE_CLONE_DIRS=()
-# Project-root-relative dirs written to the worktree's upload_dirs, so DDEV bind-mounts
-# them instead of syncing them through Mutagen (keeps big asset dirs out of Docker volumes).
-WORKTREE_UPLOAD_DIRS=()
-# Commands run inside the worktree after `ddev start`, and after the database import.
-WORKTREE_POST_START=()
-WORKTREE_POST_IMPORT=()
-# Seed dumps are ephemeral by default: exported to a temp dir and deleted after import.
-# Set WORKTREE_DB_DIR (or pass --keep-db <dir>) to retain them for --reuse-db.
-# Note: .ddev/db_snapshots is NOT a valid home - DDEV lists any *.sql.gz dropped there as
-# a snapshot, which would break `ddev snapshot restore --latest`.
-WORKTREE_DB_DIR="${WORKTREE_DB_DIR:-}"
-
-[ -f "$MAIN_ROOT/composer.json" ] && WORKTREE_POST_START=("ddev composer install")
-if [ "$PROJECT_TYPE" = "craftcms" ]; then
-  WORKTREE_COPY_FILES+=(config/license.key)
-  WORKTREE_POST_IMPORT=("ddev craft up --interactive=0")
-fi
-
+# ---- Settings ---------------------------------------------------------------------------
+# Anything .ddev/worktree.conf sets wins. Anything it leaves unset gets a default, some of
+# them detected from the project (see load_settings and `ddev worktree config`):
+#   WORKTREE_COPY_FILES   untracked files to copy; .env* get ://<project>.<tld> repointed
+#                         default: .env (+ config/license.key for craftcms)
+#   WORKTREE_CLONE_DIRS   untracked dirs to clone copy-on-write (APFS clonefile / reflink)
+#                         default (craftcms): local asset folders found in project config
+#   WORKTREE_UPLOAD_DIRS  dirs DDEV bind-mounts instead of syncing through Mutagen
+#                         default: same as the detected asset folders
+#   WORKTREE_POST_START   commands after `ddev start`
+#                         default: composer install + npm/yarn install + build script
+#   WORKTREE_POST_IMPORT  commands after the DB import; default (craftcms): craft up
+#   WORKTREE_DB_DIR       keep seed dumps here for --reuse-db (never .ddev/db_snapshots,
+#                         where DDEV lists any *.sql.gz as a snapshot)
+SETTINGS=(WORKTREE_COPY_FILES WORKTREE_CLONE_DIRS WORKTREE_UPLOAD_DIRS WORKTREE_POST_START WORKTREE_POST_IMPORT)
 CONF="$MAIN_ROOT/.ddev/worktree.conf"
-# shellcheck source=/dev/null
-[ -f "$CONF" ] && . "$CONF"
-DUMP_DIR="$WORKTREE_DB_DIR"
+ENV_DB_DIR="${WORKTREE_DB_DIR:-}"
+# Bash 3.2 (macOS /bin/bash) has no associative arrays: where each setting came from is
+# kept in SRC_<setting> (conf | default | detected).
 # -----------------------------------------------------------------------------------------
 
 # First line of the config.local.yaml this script writes. `rm` only touches worktrees
 # carrying it, so it can never delete a DDEV project it did not create.
 MARKER="# Worktree-local override so this checkout gets its own DDEV project."
-
-die()  { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
-info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 
 usage() { sed -n 's/^## Example: |-//p; s/^##   //p' "$0"; exit "${1:-0}"; }
 
@@ -121,12 +117,143 @@ docroot_relative() {
   printf '%s/%s\n' "$up" "$path"
 }
 
+# The main config.yaml's upload_dirs (inline or block list), normalised docroot-relative.
+# DDEV appends config.local.yaml's list to these, so the worktree must not repeat them.
+main_upload_dirs() {
+  awk '
+    /^upload_dirs:/ {
+      sub(/^upload_dirs:[[:space:]]*/, "")
+      if ($0 != "") { gsub(/[][]/, ""); n = split($0, a, ","); for (i = 1; i <= n; i++) print a[i]; exit }
+      inlist = 1; next
+    }
+    inlist && /^[[:space:]]*-/ { sub(/^[[:space:]]*-[[:space:]]*/, ""); print; next }
+    inlist && /^[[:space:]]*#/ { next }
+    inlist { exit }
+  ' "$MAIN_ROOT/.ddev/config.yaml" | tr -d "\"' " | sed 's#^/##; s#/$##' | grep -v '^$' || true
+}
+
 upload_dirs_yaml() {
   [ "${#WORKTREE_UPLOAD_DIRS[@]}" -gt 0 ] || return 0
-  local d
+  local d rel existing out=""
+  existing="$(main_upload_dirs)"
+  for d in "${WORKTREE_UPLOAD_DIRS[@]}"; do
+    rel="$(docroot_relative "$d")"
+    printf '%s\n' "$existing" | grep -qxF "$rel" && continue
+    out="$out  - $rel"$'\n'
+  done
+  [ -n "$out" ] || return 0
   echo "upload_dirs:"
-  for d in "${WORKTREE_UPLOAD_DIRS[@]}"; do printf '  - %s\n' "$(docroot_relative "$d")"; done
+  printf '%s' "$out"
 }
+
+env_value() {
+  sed -n "s/^$1=//p" "$MAIN_ROOT/.env" 2>/dev/null | head -1 | sed -E 's/^["'\'']//; s/["'\'']$//'
+}
+
+# Craft local asset folders, from every `path:` in project config (Craft 3 volumes and
+# Craft 4/5 filesystems), as project-root-relative dirs that exist in the main checkout.
+detect_asset_dirs() {
+  [ -d "$MAIN_ROOT/config/project" ] || return 0
+  local raw path var dirs="" parent d
+  while IFS= read -r raw; do
+    path="$(printf '%s' "$raw" | tr -d "\"'" | sed 's/[[:space:]]*$//')"
+    case "$path" in
+      \$\{*\}*) var="${path#\$\{}"; var="${var%%\}*}"; path="$(env_value "$var")${path#*\}}" ;;
+      \$*)      var="${path#\$}"; var="${var%%/*}"; path="$(env_value "$var")${path#\$"$var"}" ;;
+    esac
+    case "$path" in
+      @webroot*)       path="${DOCROOT:-.}/${path#@webroot}" ;;
+      @root*)          path="./${path#@root}" ;;
+      /var/www/html/*) path="./${path#/var/www/html/}" ;;
+      *) continue ;;
+    esac
+    path="$(printf '%s' "$path" | sed -E 's#/+#/#g; s#^\./##; s#/\./#/#g; s#/$##')"
+    case "$path" in ""|.|/*|*..*) continue ;; esac
+    [ -d "$MAIN_ROOT/$path" ] || continue
+    dirs="$dirs$path"$'\n'
+  done < <(grep -rhE '^[[:space:]]+path:[[:space:]]*[^[:space:]]' "$MAIN_ROOT/config/project" 2>/dev/null \
+           | sed -E 's/^[[:space:]]+path:[[:space:]]*//')
+  dirs="$(printf '%s' "$dirs" | sort -u)"
+  [ -n "$dirs" ] || return 0
+
+  # Collapse siblings (web/assets/images, web/assets/docs -> web/assets), but never up to
+  # the docroot or project root, which would clone the whole site.
+  while IFS= read -r d; do
+    parent="$(dirname "$d")"
+    if [ "$parent" != "." ] && [ "$parent" != "${DOCROOT:-.}" ] \
+       && [ "$(printf '%s\n' "$dirs" | grep -c "^$parent/[^/]*$")" -ge 2 ]; then
+      printf '%s\n' "$parent"
+    else
+      printf '%s\n' "$d"
+    fi
+  done <<< "$dirs" | sort -u
+}
+
+# The package.json script a worktree should build with, if any.
+detect_build_script() {
+  local s
+  [ -f "$MAIN_ROOT/package.json" ] || return 0
+  for s in build production prod; do
+    if sed -n '/"scripts"[[:space:]]*:/,/}/p' "$MAIN_ROOT/package.json" | grep -qE "^[[:space:]]*\"$s\"[[:space:]]*:"; then
+      printf '%s\n' "$s"; return 0
+    fi
+  done
+}
+
+detect_post_start() {
+  local script pm="npm" install="ddev npm ci"
+  [ -f "$MAIN_ROOT/composer.json" ] && echo "ddev composer install"
+  [ -f "$MAIN_ROOT/package.json" ] || return 0
+  if [ -f "$MAIN_ROOT/yarn.lock" ]; then pm="yarn"; install="ddev yarn install --frozen-lockfile"
+  elif [ ! -f "$MAIN_ROOT/package-lock.json" ]; then install="ddev npm install"
+  fi
+  script="$(detect_build_script)"
+  [ -n "$script" ] || return 0
+  echo "$install"
+  if [ "$pm" = "yarn" ]; then echo "ddev yarn $script"; else echo "ddev npm run $script"; fi
+}
+
+# Read .ddev/worktree.conf, then fill every setting it left unset.
+load_settings() {
+  local s line
+  for s in "${SETTINGS[@]}"; do unset "$s"; done
+  # shellcheck source=/dev/null
+  [ -f "$CONF" ] && . "$CONF"
+  for s in "${SETTINGS[@]}"; do
+    if declare -p "$s" >/dev/null 2>&1; then printf -v "SRC_$s" conf; else printf -v "SRC_$s" default; fi
+  done
+
+  if [ "$SRC_WORKTREE_COPY_FILES" = default ]; then
+    WORKTREE_COPY_FILES=(.env)
+    [ "$PROJECT_TYPE" = craftcms ] && WORKTREE_COPY_FILES+=(config/license.key)
+  fi
+  if [ "$SRC_WORKTREE_POST_IMPORT" = default ]; then
+    WORKTREE_POST_IMPORT=()
+    [ "$PROJECT_TYPE" = craftcms ] && WORKTREE_POST_IMPORT=("ddev craft up --interactive=0")
+  fi
+  if [ "$SRC_WORKTREE_POST_START" = default ]; then
+    WORKTREE_POST_START=()
+    while IFS= read -r line; do [ -n "$line" ] && WORKTREE_POST_START+=("$line"); done < <(detect_post_start)
+    SRC_WORKTREE_POST_START=detected
+  fi
+  if [ "$SRC_WORKTREE_CLONE_DIRS" = default ] || [ "$SRC_WORKTREE_UPLOAD_DIRS" = default ]; then
+    local detected=()
+    if [ "$PROJECT_TYPE" = craftcms ]; then
+      while IFS= read -r line; do [ -n "$line" ] && detected+=("$line"); done < <(detect_asset_dirs)
+    fi
+    if [ "$SRC_WORKTREE_CLONE_DIRS" = default ]; then
+      WORKTREE_CLONE_DIRS=(${detected[@]+"${detected[@]}"}); SRC_WORKTREE_CLONE_DIRS=detected
+    fi
+    if [ "$SRC_WORKTREE_UPLOAD_DIRS" = default ]; then
+      WORKTREE_UPLOAD_DIRS=(${detected[@]+"${detected[@]}"}); SRC_WORKTREE_UPLOAD_DIRS=detected
+    fi
+  fi
+
+  WORKTREE_DB_DIR="${ENV_DB_DIR:-${WORKTREE_DB_DIR:-}}"
+  DUMP_DIR="${DUMP_DIR:-$WORKTREE_DB_DIR}"
+}
+
+is_build_cmd() { case "$1" in *npm*|*yarn*|*npx*|*gulp*|*vite*|*webpack*) return 0 ;; esac; return 1; }
 
 # Copy-on-write clone where the filesystem supports it, plain copy otherwise.
 clone_dir() {
@@ -144,9 +271,39 @@ run_hooks() {
   local dir="$1" label="$2"; shift 2
   local cmd
   for cmd in "$@"; do
+    if [ "$BUILD" = "no" ] && is_build_cmd "$cmd"; then
+      note "$label: skipping '$cmd' (--no-build)"; continue
+    fi
     info "$label: $cmd"
     (cd "$dir" && eval "$cmd") || die "$label command failed: $cmd"
   done
+}
+
+build_note() {
+  [ "$SRC_WORKTREE_POST_START" = detected ] || return 0
+  [ -f "$MAIN_ROOT/package.json" ] || return 0
+  [ -z "$(detect_build_script)" ] || return 0
+  printf '%s\n' "No build/production/prod script in package.json - set WORKTREE_POST_START in .ddev/worktree.conf, or clone your built assets with WORKTREE_CLONE_DIRS"
+}
+
+print_setting() {
+  local name="$1" ref="SRC_$1" item; shift
+  printf '%s  [%s]\n' "$name" "${!ref}"
+  [ $# -gt 0 ] || echo "    (none)"
+  for item in "$@"; do printf '    %s\n' "$item"; done
+}
+
+cmd_config() {
+  printf 'Project   %s (%s), docroot: %s\n' "$MAIN_PROJECT" "${PROJECT_TYPE:-?}" "${DOCROOT:-.}"
+  printf 'Worktrees %s/%s.worktrees/<slug>  ->  https://%s-<slug>.%s\n' "$PARENT_DIR" "$BASE_NAME" "$MAIN_PROJECT" "$TLD"
+  printf 'Conf      %s\n\n' "$([ -f "$CONF" ] && echo "$CONF" || echo "none (all defaults)")"
+  print_setting WORKTREE_COPY_FILES  ${WORKTREE_COPY_FILES[@]+"${WORKTREE_COPY_FILES[@]}"}
+  print_setting WORKTREE_CLONE_DIRS  ${WORKTREE_CLONE_DIRS[@]+"${WORKTREE_CLONE_DIRS[@]}"}
+  print_setting WORKTREE_UPLOAD_DIRS ${WORKTREE_UPLOAD_DIRS[@]+"${WORKTREE_UPLOAD_DIRS[@]}"}
+  print_setting WORKTREE_POST_START  ${WORKTREE_POST_START[@]+"${WORKTREE_POST_START[@]}"}
+  print_setting WORKTREE_POST_IMPORT ${WORKTREE_POST_IMPORT[@]+"${WORKTREE_POST_IMPORT[@]}"}
+  printf 'WORKTREE_DB_DIR  %s\n' "${WORKTREE_DB_DIR:-(temp dir, deleted after import)}"
+  if [ -n "$(build_note)" ]; then echo; note "$(build_note)"; fi
 }
 
 cmd_list() {
@@ -253,6 +410,7 @@ provision() {
     info "Reusing $dump"
   fi
 
+  if [ -n "$(build_note)" ]; then note "$(build_note)"; fi
   info "Starting $project"
   (cd "$dir" && ddev start)
   run_hooks "$dir" "post-start" ${WORKTREE_POST_START[@]+"${WORKTREE_POST_START[@]}"}
@@ -351,7 +509,7 @@ cmd_rm() {
 SUBCOMMAND="${1:-}"
 [ $# -gt 0 ] && shift
 
-ARG="" BASE="" SEED="fresh" START="yes" FORCE="no"
+ARG="" BASE="" SEED="fresh" START="yes" FORCE="no" BUILD="yes" DUMP_DIR=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --from)      BASE="${2:?--from needs a ref}"; shift 2 ;;
@@ -361,6 +519,7 @@ while [ $# -gt 0 ]; do
     --reuse-db)  SEED="reuse"; shift ;;
     --no-db)     SEED="none"; shift ;;
     --no-start)  START="no"; SEED="none"; shift ;;
+    --no-build)  BUILD="no"; shift ;;
     -f|--force)  FORCE="yes"; shift ;;
     -h|--help)   usage 0 ;;
     -*)          die "Unknown flag: $1" ;;
@@ -369,8 +528,9 @@ while [ $# -gt 0 ]; do
 done
 
 case "$SUBCOMMAND" in
-  add)  cmd_add ;;
-  init) cmd_init ;;
+  add)  load_settings; cmd_add ;;
+  init) load_settings; cmd_init ;;
+  config) load_settings; cmd_config ;;
   rm|remove) cmd_rm ;;
   list|ls) cmd_list ;;
   ""|-h|--help) usage 0 ;;

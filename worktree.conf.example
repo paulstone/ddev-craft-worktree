@@ -5,7 +5,7 @@
 # exist yet; edit and commit worktree.conf, never this .example (updates replace it).
 # It is sourced by bash, so use bash array syntax. Every path is relative
 # to the project root. Uncomment and edit what you need; anything left commented keeps
-# the default shown.
+# the default shown. Run `ddev worktree config` to see the settings a worktree will get.
 
 # Untracked files copied from the main checkout. Copied .env* files have their
 # ://<project>.ddev.site URLs repointed at the worktree's own hostname.
@@ -15,16 +15,17 @@
 # Untracked directories cloned from the main checkout. On macOS (APFS) and reflink-capable
 # Linux filesystems this is copy-on-write, so a worktree uses no extra disk for them until
 # a file changes. Good for local asset volumes, vendor/, built front-end output.
-# Default: none.
+# Default (craftcms): the local asset folders found in config/project.
 # WORKTREE_CLONE_DIRS=(web/assets vendor)
 
 # Directories DDEV should bind-mount instead of syncing through Mutagen (written to the
 # worktree's upload_dirs). Use this for large asset folders so they are not duplicated
-# into a Docker volume per worktree. Default: none.
+# into a Docker volume per worktree. Default: the detected asset folders.
 # WORKTREE_UPLOAD_DIRS=(web/assets)
 
-# Commands run inside the new worktree after `ddev start`.
-# Default: ("ddev composer install") when composer.json exists.
+# Commands run inside the new worktree after `ddev start`. Setting this to () turns them off.
+# Default: composer install, then npm ci / yarn install / npm install and the first of the
+# build, production or prod scripts in package.json. `ddev worktree config` shows the result.
 # WORKTREE_POST_START=("ddev composer install" "ddev npm ci" "ddev npm run build")
 
 # Commands run after the database has been imported.
