@@ -1,7 +1,9 @@
+#ddev-generated
 # Settings for `ddev worktree` (ddev-craft-worktree add-on).
 #
-# This file is yours: it has no #ddev-generated marker, so `ddev add-on get` never
-# overwrites it. It is sourced by bash, so use bash array syntax. Every path is relative
+# On install this template is copied to .ddev/worktree.conf only if that file doesn't
+# exist yet; edit and commit worktree.conf, never this .example (updates replace it).
+# It is sourced by bash, so use bash array syntax. Every path is relative
 # to the project root. Uncomment and edit what you need; anything left commented keeps
 # the default shown.
 

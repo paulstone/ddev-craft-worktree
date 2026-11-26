@@ -117,6 +117,18 @@ teardown() {
   assert_success
 }
 
+@test "re-running add-on get keeps the user's worktree.conf" {
+  set -eu -o pipefail
+  install_addon
+  echo 'WORKTREE_POST_START=("echo custom")' >> .ddev/worktree.conf
+  run ddev add-on get "${DIR}"
+  assert_success
+  run cat .ddev/worktree.conf
+  assert_output --partial 'WORKTREE_POST_START=("echo custom")'
+  assert_output --partial 'WORKTREE_CLONE_DIRS=(web/assets)'
+  refute_output --partial '#ddev-generated'
+}
+
 # bats test_tags=release
 @test "install from release" {
   set -eu -o pipefail

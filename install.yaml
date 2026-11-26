@@ -1,7 +1,19 @@
 name: craft-worktree
 
+# worktree.conf.example is replaced on every update; worktree.conf (the user's settings)
+# is only created from it when missing, so `ddev add-on get` never clobbers settings.
 project_files:
   - commands/host/worktree
-  - worktree.conf
+  - worktree.conf.example
+
+post_install_actions:
+  - |
+    #ddev-description:Create .ddev/worktree.conf if it doesn't exist
+    if [ ! -f worktree.conf ]; then
+      sed '/^#ddev-generated$/d' worktree.conf.example > worktree.conf
+      echo "Created .ddev/worktree.conf - edit and commit it"
+    else
+      echo "Keeping existing .ddev/worktree.conf"
+    fi
 
 ddev_version_constraint: '>= v1.24.3'

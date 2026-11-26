@@ -13,7 +13,7 @@ It was built for Craft CMS, but it works with any DDEV project. Two things set i
 ddev add-on get paulstone/ddev-craft-worktree
 ```
 
-This adds `.ddev/commands/host/worktree` and `.ddev/worktree.conf`. Commit both.
+This adds `.ddev/commands/host/worktree` and, if it doesn't already exist, `.ddev/worktree.conf` (created from `.ddev/worktree.conf.example`). Commit the command and `worktree.conf`. Updating with `ddev add-on get` replaces the command and the example but never touches your `worktree.conf`.
 
 ## Commands
 
@@ -40,7 +40,7 @@ ddev worktree rm new-thing [--force]         # ddev delete + git worktree remove
 
 ## Configuration: `.ddev/worktree.conf`
 
-This file is bash-sourced and paths are relative to the project root. It has no `#ddev-generated` marker, so add-on updates never overwrite it.
+This file is bash-sourced and paths are relative to the project root. Add-on updates never overwrite it.
 
 | Setting | Default | Purpose |
 |---|---|---|
