@@ -3,35 +3,35 @@
 #
 # On install this template is copied to .ddev/worktree.conf only if that file doesn't
 # exist yet; edit and commit worktree.conf, never this .example (updates replace it).
-# It is sourced by bash, so use bash array syntax. Every path is relative
-# to the project root. Uncomment and edit what you need; anything left commented keeps
-# the default shown. Run `ddev worktree config` to see the settings a worktree will get.
+# It is sourced by bash, so use bash array syntax. Every path is relative to the project
+# root. Uncomment and edit what you need; anything left commented keeps the default shown.
+#
+# Front-end builds and other setup belong in DDEV's own `hooks: post-start:` in
+# .ddev/config.yaml, and upload_dirs there too: worktrees inherit both from git.
+#
+# WORKTREE_POST_START and WORKTREE_POST_IMPORT commands can use $WORKTREE_URL,
+# $WORKTREE_PROJECT, $WORKTREE_DIR, $MAIN_URL, $MAIN_PROJECT and $MAIN_ROOT.
 
 # Untracked files copied from the main checkout. Copied .env* files have their
 # ://<project>.ddev.site URLs repointed at the worktree's own hostname.
 # Default: (.env), plus config/license.key for craftcms projects.
 # WORKTREE_COPY_FILES=(.env config/license.key)
 
-# Untracked directories cloned from the main checkout. On macOS (APFS) and reflink-capable
-# Linux filesystems this is copy-on-write, so a worktree uses no extra disk for them until
-# a file changes. Good for local asset volumes, vendor/, built front-end output.
-# Default (craftcms): the local asset folders found in config/project.
-# WORKTREE_CLONE_DIRS=(web/assets vendor)
+# Untracked directories cloned from the main checkout, such as local asset volumes. On
+# macOS (APFS) and reflink-capable Linux filesystems this is copy-on-write, so a worktree
+# uses no extra disk for them until a file changes. Default: none.
+# WORKTREE_CLONE_DIRS=(web/assets)
 
-# Directories DDEV should bind-mount instead of syncing through Mutagen (written to the
-# worktree's upload_dirs). Use this for large asset folders so they are not duplicated
-# into a Docker volume per worktree. Default: the detected asset folders.
-# WORKTREE_UPLOAD_DIRS=(web/assets)
-
-# Commands run inside the new worktree after `ddev start`. Setting this to () turns them off.
-# Default: composer install, then npm ci / yarn install / npm install and the first of the
-# build, production or prod scripts in package.json. `ddev worktree config` shows the result.
-# WORKTREE_POST_START=("ddev composer install" "ddev npm ci" "ddev npm run build")
+# Commands run inside the new worktree after `ddev start` (and its DDEV hooks).
+# Default: ("ddev composer install") if there is a composer.json, otherwise none.
+# WORKTREE_POST_START=("ddev composer install")
 
 # Commands run after the database has been imported.
 # Default: ("ddev craft up --interactive=0") for craftcms projects, otherwise none.
 # WORKTREE_POST_IMPORT=("ddev craft up --interactive=0")
+# WordPress keeps its URL in the database:
+# WORKTREE_POST_IMPORT=('ddev wp search-replace "$MAIN_URL" "$WORKTREE_URL" --all-tables')
 
 # Keep seed dumps here (for --reuse-db) instead of deleting them after import.
 # Never point this at .ddev/db_snapshots. An environment variable of the same name wins.
-# WORKTREE_DB_DIR="${WORKTREE_DB_DIR:-$HOME/ddev-worktree-dbs}"
+# WORKTREE_DB_DIR="$HOME/ddev-worktree-dbs"

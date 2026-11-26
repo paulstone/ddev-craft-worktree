@@ -21,11 +21,11 @@ setup() {
   mkdir -p "${HOME}/tmp"
   export TESTDIR="$(mktemp -d "${HOME}/tmp/${PROJNAME}.XXXXXX")"
   export WTDIR="${TESTDIR}.worktrees"
+  export DBDIR="${TESTDIR}.dbs"
   export DDEV_NONINTERACTIVE=true
   export DDEV_NO_INSTRUMENTATION=true
   export CI=true
-  ddev delete -Oy "${PROJNAME}" >/dev/null 2>&1 || true
-  ddev delete -Oy "${PROJNAME}-smoke" >/dev/null 2>&1 || true
+  delete_projects
   cd "${TESTDIR}"
 
   # A committed DDEV project with an untracked .env and an untracked asset folder.
@@ -43,25 +43,28 @@ setup() {
   git commit -qm init
 }
 
+delete_projects() {
+  local p
+  for p in "${PROJNAME}" "${PROJNAME}-smoke" "${PROJNAME}-again"; do
+    ddev delete -Oy "$p" >/dev/null 2>&1 || true
+  done
+}
+
 install_addon() {
   run ddev add-on get "${DIR}"
   assert_success
   assert_file_exists .ddev/commands/host/worktree
   assert_file_exists .ddev/worktree.conf
-  cat >> .ddev/worktree.conf <<'EOF'
-WORKTREE_CLONE_DIRS=(web/assets)
-WORKTREE_UPLOAD_DIRS=(web/assets)
-EOF
+  echo 'WORKTREE_CLONE_DIRS=(web/assets)' >> .ddev/worktree.conf
 }
 
 teardown() {
   set -eu -o pipefail
-  ddev delete -Oy "${PROJNAME}-smoke" >/dev/null 2>&1 || true
-  ddev delete -Oy "${PROJNAME}" >/dev/null 2>&1 || true
+  delete_projects
   if [ -n "${GITHUB_ENV:-}" ]; then
-    [ -e "${GITHUB_ENV:-}" ] && echo "TESTDIR=${HOME}/tmp/${PROJNAME}" >> "${GITHUB_ENV}"
+    [ -e "${GITHUB_ENV:-}" ] && echo "TESTDIR=${TESTDIR}" >> "${GITHUB_ENV}"
   else
-    [ "${TESTDIR}" != "" ] && rm -rf "${TESTDIR}" "${WTDIR}"
+    [ "${TESTDIR}" != "" ] && rm -rf "${TESTDIR}" "${WTDIR}" "${DBDIR}"
   fi
 }
 
@@ -75,7 +78,7 @@ teardown() {
   assert_file_exists "${wt}/.ddev/config.local.yaml"
   run cat "${wt}/.ddev/config.local.yaml"
   assert_output --partial "name: ${PROJNAME}-smoke"
-  assert_output --partial "  - assets"
+  refute_output --partial "upload_dirs"
   run cat "${wt}/.env"
   assert_output --partial "https://${PROJNAME}-smoke.ddev.site"
   assert_file_exists "${wt}/web/assets/images/a.txt"
@@ -94,112 +97,130 @@ teardown() {
   run ddev worktree rm smoke
   assert_success
   assert_dir_not_exists "${wt}"
+  assert_dir_not_exists "${WTDIR}"
   assert_dir_exists "${TESTDIR}/.ddev"
 }
 
-@test "add starts its own project and seeds the database" {
+@test "a clone dir holding only tracked files is still cloned; unsafe entries are skipped" {
   set -eu -o pipefail
+  mkdir -p web/uploads
+  printf '*\n!.gitkeep\n' > web/uploads/.gitignore
+  touch web/uploads/.gitkeep
+  echo 'up' > web/uploads/u.txt
+  git add -f web/uploads/.gitignore web/uploads/.gitkeep && git commit -qm uploads
+  run ddev add-on get "${DIR}"
+  assert_success
+  echo 'WORKTREE_CLONE_DIRS=("" .. web/uploads)' >> .ddev/worktree.conf
+
+  run ddev worktree add feature/smoke --no-start
+  assert_success
+  assert_output --partial "Skipping WORKTREE_CLONE_DIRS entry ''"
+  assert_output --partial "Skipping WORKTREE_CLONE_DIRS entry '..'"
+  assert_file_exists "${WTDIR}/smoke/web/uploads/u.txt"
+  assert_file_exists "${WTDIR}/smoke/web/index.php"
+  run git -C "${WTDIR}/smoke" status --porcelain
+  assert_output ""
+}
+
+@test "add seeds the database before DDEV hooks run, keeps and reuses dumps, and exports hook variables" {
+  set -eu -o pipefail
+  # A DDEV post-start hook that reads the database: it must see the seeded row.
+  cat >> .ddev/config.yaml <<'EOF'
+hooks:
+  post-start:
+    - exec: "mysql -N -e 'select id from seeded' > /var/www/html/hookdb.txt 2>&1 || true"
+EOF
+  printf 'hookdb.txt\nhookvars.txt\n' >> .gitignore
+  git add -A && git commit -qm hooks
+  install_addon
+  cat >> .ddev/worktree.conf <<'EOF'
+WORKTREE_POST_IMPORT=('echo "$MAIN_URL -> $WORKTREE_URL ($WORKTREE_PROJECT)" > "$WORKTREE_DIR/hookvars.txt"')
+EOF
+  run ddev start -y
+  assert_success
+  run ddev mysql -e "create table seeded (id int); insert into seeded values (42);"
+  assert_success
+
+  # A relative --keep-db is relative to where the command runs.
+  run ddev worktree add feature/smoke --keep-db "../$(basename "${DBDIR}")"
+  assert_success
+  run curl -sfk --retry 10 --retry-all-errors --retry-delay 1 "https://${PROJNAME}-smoke.ddev.site/"
+  assert_success
+  assert_output --partial "https://${PROJNAME}-smoke.ddev.site"
+  run curl -sfk --retry 10 --retry-all-errors --retry-delay 1 "https://${PROJNAME}-smoke.ddev.site/assets/images/a.txt"
+  assert_output "img"
+  run cat "${WTDIR}/smoke/hookdb.txt"
+  assert_output "42"
+  run cat "${WTDIR}/smoke/hookvars.txt"
+  assert_output "https://${PROJNAME}.ddev.site -> https://${PROJNAME}-smoke.ddev.site (${PROJNAME}-smoke)"
+  run bash -c "ls '${DBDIR}'/*.sql.gz"
+  assert_success
+
+  run ddev worktree add feature/again --reuse-db --keep-db "${DBDIR}"
+  assert_success
+  assert_output --partial "Reusing ${DBDIR}/"
+  run cat "${WTDIR}/again/hookdb.txt"
+  assert_output "42"
+
+  run ddev worktree rm smoke
+  assert_success
+  run ddev worktree rm again
+  assert_success
+  run ddev describe "${PROJNAME}"
+  assert_success
+}
+
+@test "a project without a db container is not seeded" {
+  set -eu -o pipefail
+  run ddev config --omit-containers=db
+  assert_success
+  git add -A && git commit -qm nodb
   install_addon
   run ddev start -y
   assert_success
 
   run ddev worktree add feature/smoke
   assert_success
-  run curl -sfk "https://${PROJNAME}-smoke.ddev.site/"
-  assert_success
-  assert_output --partial "https://${PROJNAME}-smoke.ddev.site"
-  run curl -sfk "https://${PROJNAME}-smoke.ddev.site/assets/images/a.txt"
-  assert_output "img"
-
-  run ddev worktree rm smoke
-  assert_success
-  run ddev describe "${PROJNAME}"
+  assert_output --partial "omits the db container"
+  run curl -sfk --retry 10 --retry-all-errors --retry-delay 1 "https://${PROJNAME}-smoke.ddev.site/"
   assert_success
 }
 
-@test "craftcms: local asset folders are detected from project config" {
+@test "composer install is the default post-start; an empty conf setting turns it off" {
   set -eu -o pipefail
-  run ddev config --project-type=craftcms
-  assert_success
-  mkdir -p config/project web/assets/images web/assets/docs web/uploads
-  echo 'doc' > web/assets/docs/d.txt
-  printf 'ASSET_BASE="@webroot/uploads"\n' >> .env
-  cat > config/project/project.yaml <<'EOF'
-fs:
-  images:
-    settings:
-      path: '@webroot/assets/images'
-    type: craft\fs\Local
-  docs:
-    settings:
-      path: "@root/web/assets/docs"
-    type: craft\fs\Local
-  uploads:
-    settings:
-      path: $ASSET_BASE
-    type: craft\fs\Local
-  remote:
-    settings:
-      path: '@webroot/missing'
-    type: craft\fs\Local
-EOF
-  # Main already bind-mounts uploads, so the worktree must not list it again.
-  printf 'upload_dirs:\n  - uploads\n' >> .ddev/config.yaml
-  git add -A && git commit -qm craft
-  run ddev add-on get "${DIR}"
-  assert_success
-
-  run ddev worktree config
-  assert_success
-  assert_output --partial "WORKTREE_CLONE_DIRS  [detected]"
-  assert_output --partial "    web/assets"
-  assert_output --partial "    web/uploads"
-  refute_output --partial "web/assets/images"
-  refute_output --partial "missing"
-  assert_output --partial "ddev craft up --interactive=0"
-  assert_output --partial "config/license.key"
-
-  run ddev worktree add feature/smoke --no-start
-  assert_success
-  local wt="${WTDIR}/smoke"
-  assert_file_exists "${wt}/web/assets/docs/d.txt"
-  run cat "${wt}/.ddev/config.local.yaml"
-  assert_output --partial "  - assets"
-  refute_output --partial "  - uploads"
-}
-
-@test "build script is detected and run; an empty conf setting turns it off" {
-  set -eu -o pipefail
-  cat > package.json <<'EOF'
-{
-  "name": "fixture",
-  "private": true,
-  "scripts": {
-    "dev": "echo dev",
-    "production": "mkdir -p web/dist && echo built > web/dist/ok.txt"
-  }
-}
-EOF
-  git add package.json && git commit -qm pkg
-  run ddev add-on get "${DIR}"
-  assert_success
-
-  run ddev worktree config
-  assert_output --partial "ddev npm install"
-  assert_output --partial "ddev npm run production"
-
+  echo '{}' > composer.json
+  git add composer.json && git commit -qm composer
+  install_addon
   run ddev start -y
   assert_success
   run ddev worktree add feature/smoke --no-db
   assert_success
-  assert_file_exists "${WTDIR}/smoke/web/dist/ok.txt"
+  assert_output --partial "post-start: ddev composer install"
   run ddev worktree rm smoke --force
   assert_success
 
   echo 'WORKTREE_POST_START=()' >> .ddev/worktree.conf
-  run ddev worktree config
-  assert_output --partial "WORKTREE_POST_START  [conf]"
-  refute_output --partial "ddev npm run production"
+  run ddev worktree add feature/smoke --no-db
+  assert_success
+  refute_output --partial "post-start:"
+}
+
+@test "an uncommitted .ddev/config.yaml gets a clear error" {
+  set -eu -o pipefail
+  install_addon
+  git rm -q --cached .ddev/config.yaml && git commit -qm untrack
+  run ddev worktree add feature/smoke --no-start
+  assert_failure
+  assert_output --partial ".ddev/config.yaml must be committed"
+}
+
+@test "a removed setting in worktree.conf gets a notice" {
+  set -eu -o pipefail
+  install_addon
+  echo 'WORKTREE_UPLOAD_DIRS=(web/assets)' >> .ddev/worktree.conf
+  run ddev worktree add feature/smoke --no-start
+  assert_success
+  assert_output --partial "WORKTREE_UPLOAD_DIRS is no longer used"
 }
 
 @test "a project without git gets a clear error" {
