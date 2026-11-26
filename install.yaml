@@ -1,0 +1,7 @@
+name: craft-worktree
+
+project_files:
+  - commands/host/worktree
+  - worktree.conf
+
+ddev_version_constraint: '>= v1.24.3'

@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+#ddev-generated
+## Description: Manage git worktrees that each get their own DDEV project + seeded database
+## Usage: worktree <add|init|rm|list> [branch|worktree] [flags]
+## Example: |-
+##   ddev worktree add feature/new-thing         # worktree + ddev project + fresh DB copy
+##   ddev worktree add feature/x --keep-db ../myproject-dbs   # retain the dump
+##   ddev worktree add feature/x --reuse-db      # reuse newest dump (needs WORKTREE_DB_DIR/--keep-db)
+##   ddev worktree add feature/x --no-db         # skip the database seed
+##   ddev worktree add feature/x --from main     # base a new branch on another ref
+##   ddev worktree init                          # provision the existing worktree you are in
+##   ddev worktree init some-worktree            # ...or a named one (takes the same DB flags as add)
+##   ddev worktree list
+##   ddev worktree rm new-thing                  # ddev delete + git worktree remove
+##   ddev worktree rm new-thing --force          # ...discarding uncommitted changes
+## Flags: [{"Name":"from","Usage":"base ref for a new branch (default: main worktree HEAD)"},{"Name":"keep-db","Usage":"directory to retain the seed dump in (default: temp, deleted after import)"},{"Name":"reuse-db","Usage":"reuse the newest dump instead of exporting a fresh one"},{"Name":"no-db","Usage":"skip the database seed"},{"Name":"no-start","Usage":"scaffold only; do not run ddev start"},{"Name":"force","Usage":"rm: discard uncommitted changes in the worktree"}]
+#
+# Part of the ddev-craft-worktree add-on. Per-project settings live in .ddev/worktree.conf.
+
+set -euo pipefail
+
+# The main worktree is always the first entry of `git worktree list`.
+MAIN_ROOT="$(git -C "${DDEV_APPROOT}" worktree list --porcelain | sed -n '/^worktree /{s///p;q;}')"
+PARENT_DIR="$(dirname "$MAIN_ROOT")"
+BASE_NAME="$(basename "$MAIN_ROOT")"
+
+yaml_value() { sed -n "s/^$1:[[:space:]]*//p" "$2" 2>/dev/null | head -1 | tr -d "\"'"; }
+
+# Worktree projects are named after the DDEV project (myproj-<slug>), while directories
+# follow the checkout (<checkout>.worktrees/<slug>); the two can differ.
+MAIN_PROJECT="$(yaml_value name "$MAIN_ROOT/.ddev/config.yaml")"
+MAIN_PROJECT="${MAIN_PROJECT:-${DDEV_PROJECT:-$BASE_NAME}}"
+PROJECT_TYPE="${DDEV_PROJECT_TYPE:-$(yaml_value type "$MAIN_ROOT/.ddev/config.yaml")}"
+DOCROOT="$(yaml_value docroot "$MAIN_ROOT/.ddev/config.yaml")"
+TLD="${DDEV_TLD:-ddev.site}"
+
+# ---- Settings (override any of these in .ddev/worktree.conf) ---------------------------
+# Untracked files copied from the main checkout. Copied .env* files get their
+# ://<project>.<tld> URLs repointed at the worktree's own hostname.
+WORKTREE_COPY_FILES=(.env)
+# Untracked directories cloned from the main checkout. On APFS (macOS) and reflink-capable
+# Linux filesystems this is copy-on-write: no extra disk until a file is changed.
+WORKTREE_CLONE_DIRS=()
+# Project-root-relative dirs written to the worktree's upload_dirs, so DDEV bind-mounts
+# them instead of syncing them through Mutagen (keeps big asset dirs out of Docker volumes).
+WORKTREE_UPLOAD_DIRS=()
+# Commands run inside the worktree after `ddev start`, and after the database import.
+WORKTREE_POST_START=()
+WORKTREE_POST_IMPORT=()
+# Seed dumps are ephemeral by default: exported to a temp dir and deleted after import.
+# Set WORKTREE_DB_DIR (or pass --keep-db <dir>) to retain them for --reuse-db.
+# Note: .ddev/db_snapshots is NOT a valid home - DDEV lists any *.sql.gz dropped there as
+# a snapshot, which would break `ddev snapshot restore --latest`.
+WORKTREE_DB_DIR="${WORKTREE_DB_DIR:-}"
+
+[ -f "$MAIN_ROOT/composer.json" ] && WORKTREE_POST_START=("ddev composer install")
+if [ "$PROJECT_TYPE" = "craftcms" ]; then
+  WORKTREE_COPY_FILES+=(config/license.key)
+  WORKTREE_POST_IMPORT=("ddev craft up --interactive=0")
+fi
+
+CONF="$MAIN_ROOT/.ddev/worktree.conf"
+# shellcheck source=/dev/null
+[ -f "$CONF" ] && . "$CONF"
+DUMP_DIR="$WORKTREE_DB_DIR"
+# -----------------------------------------------------------------------------------------
+
+# First line of the config.local.yaml this script writes. `rm` only touches worktrees
+# carrying it, so it can never delete a DDEV project it did not create.
+MARKER="# Worktree-local override so this checkout gets its own DDEV project."
+
+die()  { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
+info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
+
+usage() { sed -n 's/^## Example: |-//p; s/^##   //p' "$0"; exit "${1:-0}"; }
+
+slugify() { printf '%s' "$1" | tr '[:upper:]_ ' '[:lower:]--' | tr -cd 'a-z0-9-'; }
+
+worktree_paths() { git -C "$MAIN_ROOT" worktree list --porcelain | sed -n 's/^worktree //p'; }
+
+project_url() { printf 'https://%s.%s' "$1" "$TLD"; }
+
+# Resolve a path, directory name or slug to a registered worktree of this repo.
+resolve_worktree() {
+  local target="$1" abs="" path name match="" count=0
+  [ -d "$target" ] && abs="$(cd "$target" && pwd -P)"
+  while IFS= read -r path; do
+    name="$(basename "$path")"
+    if [ "$path" = "$abs" ] || [ "$name" = "$target" ] || [ "$name" = "$BASE_NAME-$target" ]; then
+      match="$path"; count=$((count + 1))
+    fi
+  done < <(worktree_paths)
+  [ "$count" -gt 0 ] || die "No worktree of this repo matches '$target' (see: ddev worktree list)"
+  [ "$count" -eq 1 ] || die "'$target' matches $count worktrees - pass the full path instead"
+  printf '%s\n' "$match"
+}
+
+# The main checkout may run on an uncommitted .ddev/config.yaml (e.g. a newer PHP or
+# database than what's committed). Mirror those stack settings into the worktree so the
+# imported dump lands in the same database engine; prints nothing when config.yaml is clean.
+stack_overrides() {
+  git -C "$MAIN_ROOT" diff --quiet -- .ddev/config.yaml && return 0
+  info "Main .ddev/config.yaml has uncommitted changes - mirroring php_version/database" >&2
+  echo "# Mirrored from the main checkout's uncommitted .ddev/config.yaml"
+  awk '
+    /^php_version:/ { print; next }
+    /^database:/    { print; in_db = 1; next }
+    in_db && /^[[:space:]]/ { print; next }
+    { in_db = 0 }
+  ' "$MAIN_ROOT/.ddev/config.yaml"
+}
+
+# DDEV's upload_dirs are relative to the docroot; settings are relative to the project root.
+docroot_relative() {
+  local path="${1#/}" up=""
+  if [ -z "$DOCROOT" ] || [ "$DOCROOT" = "." ]; then printf '%s\n' "$path"; return; fi
+  case "$path" in
+    "$DOCROOT"/*) printf '%s\n' "${path#"$DOCROOT"/}"; return ;;
+  esac
+  up="$(printf '%s' "$DOCROOT" | sed -E 's#[^/]+#..#g')"
+  printf '%s/%s\n' "$up" "$path"
+}
+
+upload_dirs_yaml() {
+  [ "${#WORKTREE_UPLOAD_DIRS[@]}" -gt 0 ] || return 0
+  local d
+  echo "upload_dirs:"
+  for d in "${WORKTREE_UPLOAD_DIRS[@]}"; do printf '  - %s\n' "$(docroot_relative "$d")"; done
+}
+
+# Copy-on-write clone where the filesystem supports it, plain copy otherwise.
+clone_dir() {
+  local src="$1" dst="$2"
+  mkdir -p "$(dirname "$dst")"
+  if [ "$(uname -s)" = "Darwin" ] && cp -cR "$src" "$dst" 2>/dev/null; then return 0; fi
+  rm -rf "$dst"
+  if cp -R --reflink=auto "$src" "$dst" 2>/dev/null; then return 0; fi
+  rm -rf "$dst"
+  info "Copy-on-write clone unavailable - making a full copy of $src"
+  cp -R "$src" "$dst"
+}
+
+run_hooks() {
+  local dir="$1" label="$2"; shift 2
+  local cmd
+  for cmd in "$@"; do
+    info "$label: $cmd"
+    (cd "$dir" && eval "$cmd") || die "$label command failed: $cmd"
+  done
+}
+
+cmd_list() {
+  local path="" branch="" line conf project
+  printf '%-55s %-35s %s\n' "WORKTREE" "BRANCH" "DDEV PROJECT"
+  while IFS= read -r line || [ -n "$path" ]; do
+    case "$line" in
+      "worktree "*) path="${line#worktree }"; branch="(detached)" ;;
+      "branch "*)   branch="${line#branch refs/heads/}" ;;
+      "")
+        [ -n "$path" ] || continue
+        conf="$path/.ddev/config.local.yaml"
+        if [ "$path" = "$MAIN_ROOT" ]; then
+          project="$MAIN_PROJECT  $(project_url "$MAIN_PROJECT")  (main)"
+        elif grep -qxF "$MARKER" "$conf" 2>/dev/null; then
+          project="$(yaml_value name "$conf")"
+          project="$project  $(project_url "$project")"
+        else
+          project="- not provisioned (ddev worktree init $(basename "$path"))"
+        fi
+        printf '%-55s %-35s %s\n' "$path" "$branch" "$project"
+        path="" ;;
+    esac
+  done < <(git -C "$MAIN_ROOT" worktree list --porcelain; echo)
+}
+
+# Turn an existing worktree checkout into its own DDEV project, optionally seeded + started.
+provision() {
+  local dir="$1" project="$2" url
+  url="$(project_url "$project")"
+
+  # 1. Unique DDEV project name without touching tracked config.yaml.
+  #    .ddev/.gitignore ignores /config.local.y*ml, so this stays invisible to git.
+  #    That .gitignore is itself DDEV-generated (untracked), so seed it from the main
+  #    worktree until `ddev start` writes its own copy.
+  [ -f "$dir/.ddev/.gitignore" ] || cp "$MAIN_ROOT/.ddev/.gitignore" "$dir/.ddev/.gitignore" 2>/dev/null || true
+  info "Writing .ddev/config.local.yaml (name: $project)"
+  {
+    printf '%s\n' "$MARKER"
+    printf '%s\n' "# Generated by \`ddev worktree\`. Gitignored - do not commit."
+    printf 'name: %s\n' "$project"
+    upload_dirs_yaml
+    stack_overrides
+  } > "$dir/.ddev/config.local.yaml"
+
+  # 2. If .ddev/.env.web is tracked, DDEV still rewrites it on every start.
+  #    skip-worktree is per-worktree (each worktree has its own index), so this only
+  #    affects this checkout. Undo with: git update-index --no-skip-worktree .ddev/.env.web
+  if git -C "$dir" ls-files --error-unmatch .ddev/.env.web >/dev/null 2>&1; then
+    git -C "$dir" update-index --skip-worktree .ddev/.env.web
+  fi
+
+  # 3. Untracked files and directories git can't bring across.
+  local f d
+  for f in ${WORKTREE_COPY_FILES[@]+"${WORKTREE_COPY_FILES[@]}"}; do
+    if [ -e "$dir/$f" ]; then
+      info "Keeping existing $f"
+    elif [ -f "$MAIN_ROOT/$f" ]; then
+      info "Copying $f"
+      mkdir -p "$(dirname "$dir/$f")"
+      cp "$MAIN_ROOT/$f" "$dir/$f"
+      case "$(basename "$f")" in
+        .env*)
+          info "Repointing $f URLs at $url"
+          sed -i.wtbak "s#://$MAIN_PROJECT\.$TLD#://$project.$TLD#g" "$dir/$f"
+          rm -f "$dir/$f.wtbak" ;;
+      esac
+    fi
+  done
+  for d in ${WORKTREE_CLONE_DIRS[@]+"${WORKTREE_CLONE_DIRS[@]}"}; do
+    if [ -e "$dir/$d" ] && [ -n "$(ls -A "$dir/$d" 2>/dev/null)" ]; then
+      info "Keeping existing $d"
+    elif [ -d "$MAIN_ROOT/$d" ]; then
+      info "Cloning $d"
+      rmdir "$dir/$d" 2>/dev/null || true
+      clone_dir "$MAIN_ROOT/$d" "$dir/$d"
+    fi
+  done
+
+  if [ "$START" = "no" ]; then
+    info "Scaffolded. Next: cd $dir && ddev start"
+    return
+  fi
+
+  # 4. Database seed, staged through $DUMP_DIR.
+  local dump="" tmpdir=""
+  if [ "$SEED" = "fresh" ]; then
+    if [ -n "$DUMP_DIR" ]; then
+      mkdir -p "$DUMP_DIR"
+      dump="$DUMP_DIR/$BASE_NAME-$(date +%Y%m%d-%H%M%S).sql.gz"
+    else
+      tmpdir="$(mktemp -d)"
+      # shellcheck disable=SC2064
+      trap "rm -rf '$tmpdir'" EXIT
+      dump="$tmpdir/seed.sql.gz"
+    fi
+    info "Exporting database from $MAIN_PROJECT"
+    (cd "$MAIN_ROOT" && ddev start >/dev/null && ddev export-db --gzip --file="$dump")
+  elif [ "$SEED" = "reuse" ]; then
+    [ -n "$DUMP_DIR" ] || die "--reuse-db needs a dump directory: set WORKTREE_DB_DIR or pass --keep-db <dir>"
+    # shellcheck disable=SC2012
+    dump="$(ls -t "$DUMP_DIR"/*.sql.gz 2>/dev/null | head -1 || true)"
+    [ -n "$dump" ] || die "No *.sql.gz found in $DUMP_DIR - run without --reuse-db"
+    info "Reusing $dump"
+  fi
+
+  info "Starting $project"
+  (cd "$dir" && ddev start)
+  run_hooks "$dir" "post-start" ${WORKTREE_POST_START[@]+"${WORKTREE_POST_START[@]}"}
+
+  if [ -n "$dump" ]; then
+    info "Importing database into $project"
+    (cd "$dir" && ddev import-db --file="$dump")
+    run_hooks "$dir" "post-import" ${WORKTREE_POST_IMPORT[@]+"${WORKTREE_POST_IMPORT[@]}"}
+  fi
+
+  info "Ready: $url  ($dir)"
+}
+
+cmd_add() {
+  local branch="$ARG"
+  [ -n "$branch" ] || usage 1
+
+  # feature/new-thing -> <checkout>.worktrees/new-thing (project <project>-new-thing),
+  # the same layout editors and agents use, so `init` and `add` end up in one place.
+  local slug dir project
+  slug="$(slugify "${branch##*/}")"
+  [ -n "$slug" ] || die "Could not derive a directory name from '$branch'"
+  dir="$PARENT_DIR/$BASE_NAME.worktrees/$slug"
+  project="$MAIN_PROJECT-$slug"
+
+  [ -e "$dir" ] && die "$dir already exists"
+
+  info "Creating worktree $dir on $branch"
+  if git -C "$MAIN_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$MAIN_ROOT" worktree add "$dir" "$branch"
+  elif git -C "$MAIN_ROOT" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    git -C "$MAIN_ROOT" worktree add --track -b "$branch" "$dir" "origin/$branch"
+  else
+    git -C "$MAIN_ROOT" worktree add -b "$branch" "$dir" "${BASE:-HEAD}"
+  fi
+
+  provision "$dir" "$project"
+}
+
+# Provision a worktree that something else created (git worktree add, an editor, an agent).
+# Until this runs, such a checkout still claims the main project's name and database.
+cmd_init() {
+  local dir slug project
+  if [ -n "$ARG" ]; then
+    dir="$(resolve_worktree "$ARG")"
+  else
+    dir="$(git -C "$DDEV_APPROOT" rev-parse --show-toplevel)"
+  fi
+  [ "$dir" = "$MAIN_ROOT" ] && die "This is the main worktree - run init inside a worktree, or name one: ddev worktree init <worktree>"
+  [ -e "$dir/.ddev/config.local.yaml" ] && die "$dir/.ddev/config.local.yaml already exists - delete it first to re-run init"
+
+  # <checkout>.worktrees/some-task -> <project>-some-task; <project>-x stays as is
+  slug="$(slugify "$(basename "$dir")")"
+  [ -n "$slug" ] || die "Could not derive a project name from '$dir'"
+  case "$slug" in
+    "$MAIN_PROJECT"-*) project="$slug" ;;
+    "$BASE_NAME"-*)    project="$MAIN_PROJECT-${slug#"$BASE_NAME"-}" ;;
+    *)                 project="$MAIN_PROJECT-$slug" ;;
+  esac
+
+  info "Provisioning existing worktree $dir"
+  provision "$dir" "$project"
+}
+
+cmd_rm() {
+  [ -n "$ARG" ] || usage 1
+  local dir conf project dirty
+  dir="$(resolve_worktree "$ARG")"
+  [ "$dir" = "$MAIN_ROOT" ] && die "Refusing to remove the main worktree"
+
+  # Without our config.local.yaml the checkout resolves to the main project's name, so
+  # `ddev delete` there would drop the main database.
+  conf="$dir/.ddev/config.local.yaml"
+  grep -qxF "$MARKER" "$conf" 2>/dev/null \
+    || die "$dir was not provisioned by ddev worktree - remove it with: git worktree remove $dir"
+  project="$(yaml_value name "$conf")"
+  [ -n "$project" ] || die "No project name found in $conf"
+  [ "$project" = "$MAIN_PROJECT" ] && die "$conf names the main project ($MAIN_PROJECT) - refusing to delete it"
+
+  # Check before deleting anything, so a refusal leaves the database intact too.
+  dirty="$(git -C "$dir" status --porcelain)"
+  if [ -n "$dirty" ] && [ "$FORCE" != "yes" ]; then
+    printf '%s\n' "$dirty" >&2
+    die "$dir has uncommitted changes - commit or stash them, or pass --force to discard"
+  fi
+
+  info "Deleting DDEV project $project"
+  ddev delete -Oy "$project" || info "ddev delete failed (never started?) - continuing"
+  info "Removing worktree $dir"
+  # Untracked clones/copies (vendor, assets, .env) are expected, so always --force once
+  # tracked changes have been checked above.
+  git -C "$MAIN_ROOT" worktree remove --force "$dir"
+  info "Done. The branch itself was kept."
+}
+
+SUBCOMMAND="${1:-}"
+[ $# -gt 0 ] && shift
+
+ARG="" BASE="" SEED="fresh" START="yes" FORCE="no"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --from)      BASE="${2:?--from needs a ref}"; shift 2 ;;
+    --from=*)    BASE="${1#*=}"; shift ;;
+    --keep-db)   DUMP_DIR="${2:?--keep-db needs a directory}"; shift 2 ;;
+    --keep-db=*) DUMP_DIR="${1#*=}"; shift ;;
+    --reuse-db)  SEED="reuse"; shift ;;
+    --no-db)     SEED="none"; shift ;;
+    --no-start)  START="no"; SEED="none"; shift ;;
+    -f|--force)  FORCE="yes"; shift ;;
+    -h|--help)   usage 0 ;;
+    -*)          die "Unknown flag: $1" ;;
+    *)           [ -z "$ARG" ] || die "Unexpected argument: $1"; ARG="$1"; shift ;;
+  esac
+done
+
+case "$SUBCOMMAND" in
+  add)  cmd_add ;;
+  init) cmd_init ;;
+  rm|remove) cmd_rm ;;
+  list|ls) cmd_list ;;
+  ""|-h|--help) usage 0 ;;
+  *) die "Unknown subcommand: $SUBCOMMAND" ;;
+esac
